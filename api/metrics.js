@@ -1,56 +1,43 @@
-const VAANI_BASE = 'https://api.vaanivoice.ai/api/call-history';
-const AGENT_NAME = 'aangan-phone-enquiry-agent';
-// Engagement threshold: calls shorter than this are treated as hangups/misdials,
-// not real enquiries, for the "engaged calls" proxy metric.
-const ENGAGED_THRESHOLD_SEC = 45;
 // Case 03: average project value cited as Rs 8-14 lakh; use the midpoint.
 const AVG_PROJECT_VALUE_INR = 1100000;
 
-async function fetchAllCalls(apiKey) {
-  let page = 1;
-  const pageSize = 200;
-  let all = [];
-  while (true) {
-    const res = await fetch(`${VAANI_BASE}?page=${page}&page_size=${pageSize}`, {
-      headers: { 'X-API-Key': apiKey },
-    });
-    if (!res.ok) {
-      throw new Error(`Vaani API error ${res.status}`);
+async function fetchAllCalls(supabaseUrl, serviceKey) {
+  const res = await fetch(
+    `${supabaseUrl}/rest/v1/calls?select=*&order=created_at.desc&limit=1000`,
+    {
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+      },
     }
-    const json = await res.json();
-    all = all.concat(json.data || []);
-    if (!json.pagination?.has_next) break;
-    page += 1;
-    if (page > 20) break; // safety cap
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Supabase error ${res.status}: ${body}`);
   }
-  return all;
+  return res.json();
 }
 
 module.exports = async (req, res) => {
-  const apiKey = process.env.VAANI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'VAANI_API_KEY not configured' });
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !serviceKey) {
+    return res.status(500).json({ error: 'Supabase not configured' });
   }
 
   try {
-    const all = await fetchAllCalls(apiKey);
-    const calls = all.filter((c) => c.agent_name === AGENT_NAME);
+    const calls = await fetchAllCalls(supabaseUrl, serviceKey);
 
     const totalCalls = calls.length;
-    const totalCostInr = calls.reduce((sum, c) => sum + (c.call_cost || 0), 0);
-    const avgCostInr = totalCalls ? totalCostInr / totalCalls : 0;
+    const qualifiedCalls = calls.filter((c) => c.qualified_status === 'Qualified');
+    const needsReviewCalls = calls.filter((c) => c.qualified_status === 'Needs Review');
+    const declinedCalls = calls.filter((c) => c.qualified_status === 'Declined');
+    const bookedCalls = calls.filter((c) => c.consultation_booked);
 
-    const durationsSec = calls.map((c) => (c.duration_ms || 0) / 1000);
-    const avgDurationSec = totalCalls
-      ? durationsSec.reduce((a, b) => a + b, 0) / totalCalls
-      : 0;
-
-    const engagedCalls = calls.filter(
-      (c) => (c.duration_ms || 0) / 1000 >= ENGAGED_THRESHOLD_SEC
-    );
-    const engagedCount = engagedCalls.length;
-    const engagementRate = totalCalls ? engagedCount / totalCalls : 0;
-    const pipelineValueInr = engagedCount * AVG_PROJECT_VALUE_INR;
+    const qualifiedCount = qualifiedCalls.length;
+    const qualifiedRate = totalCalls ? qualifiedCount / totalCalls : 0;
+    const bookedCount = bookedCalls.length;
+    const pipelineValueInr = qualifiedCount * AVG_PROJECT_VALUE_INR;
 
     // Calls per day, last 14 days
     const days = [];
@@ -62,37 +49,35 @@ module.exports = async (req, res) => {
     }
     const byDay = Object.fromEntries(days.map((d) => [d, 0]));
     calls.forEach((c) => {
-      const day = (c.Start_time || '').slice(0, 10);
+      const day = (c.created_at || '').slice(0, 10);
       if (day in byDay) byDay[day] += 1;
     });
     const callsPerDay = days.map((d) => ({ date: d, count: byDay[d] }));
 
-    const recentCalls = calls
-      .slice()
-      .sort((a, b) => new Date(b.Start_time) - new Date(a.Start_time))
-      .slice(0, 10)
-      .map((c) => ({
-        call_id: c.call_id,
-        start_time: c.Start_time,
-        duration_sec: Math.round((c.duration_ms || 0) / 1000),
-        cost_inr: c.call_cost || 0,
-        status: c.call_status,
-        caller_name: c.call_metadata?.name || c.call_entity?.name || null,
-      }));
+    const recentCalls = calls.slice(0, 10).map((c) => ({
+      id: c.id,
+      created_at: c.created_at,
+      caller_name: c.caller_name,
+      project_type: c.project_type,
+      location: c.location,
+      qualified_status: c.qualified_status,
+      consultation_booked: c.consultation_booked,
+      consultation_datetime: c.consultation_datetime,
+    }));
 
-    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=60');
+    res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=30');
     return res.status(200).json({
       totalCalls,
-      totalCostInr,
-      avgCostInr,
-      avgDurationSec,
-      engagedCount,
-      engagementRate,
+      qualifiedCount,
+      qualifiedRate,
+      needsReviewCount: needsReviewCalls.length,
+      declinedCount: declinedCalls.length,
+      bookedCount,
       pipelineValueInr,
       avgProjectValueInr: AVG_PROJECT_VALUE_INR,
-      engagedThresholdSec: ENGAGED_THRESHOLD_SEC,
       callsPerDay,
       recentCalls,
+      isSampleData: false,
       generatedAt: new Date().toISOString(),
     });
   } catch (err) {
